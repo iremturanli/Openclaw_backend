@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+# Tests run against a real, dedicated Postgres test database (see
+# tests/conftest.py). asyncio_mode = "auto" lets `async def test_*` run without
+# per-test decorators.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra"

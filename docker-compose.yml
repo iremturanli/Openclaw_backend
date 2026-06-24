@@ -1,0 +1,52 @@
+# StayWallet backend stack — API + PostgreSQL.
+#
+#   docker compose up -d --build     # build image, start db + api
+#   docker compose logs -f api       # follow API logs (migrate → seed → serve)
+#   docker compose down              # stop (keeps data in the named volume)
+#   docker compose down -v           # stop + wipe the database volume
+#
+# The API reads secrets (OpenAI / SerpApi / ElevenLabs / Stripe keys) from the
+# `.env` file via `env_file`; the DB connection is overridden below to point at
+# the `db` service inside the compose network.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: staywallet-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: staywallet
+      POSTGRES_PASSWORD: staywallet
+      POSTGRES_DB: staywallet
+    ports:
+      # Host access for psql/debugging on 5544 (avoids clashing with a local
+      # Postgres on 5432). Safe to drop in production.
+      - "5544:5432"
+    volumes:
+      - staywallet_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U staywallet -d staywallet"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    image: staywallet-backend
+    container_name: staywallet-api
+    restart: unless-stopped
+    # Secrets / provider keys come from .env (STAYWALLET_* names).
+    env_file:
+      - .env
+    environment:
+      # Override the DB URLs from .env so the container talks to the `db`
+      # service over the compose network instead of host localhost:5544.
+      STAYWALLET_DATABASE_URL: postgresql+asyncpg://staywallet:staywallet@db:5432/staywallet
+      STAYWALLET_DATABASE_URL_SYNC: postgresql+psycopg2://staywallet:staywallet@db:5432/staywallet
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  staywallet_pgdata:
