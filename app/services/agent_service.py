@@ -98,8 +98,21 @@ _SYSTEM_PROMPT = (
     "'İstiklal Caddesi’ne yakın' into only the city. "
     "(17) Clarification memory: if you asked the user for missing dates, city, "
     "budget, or preference, treat the next short user message as the answer to that "
-    "clarification, not as a new unrelated request."
-
+    "clarification, not as a new unrelated request. "
+    "(18) Sort intent: every search_* tool takes a `sort` argument. Infer it "
+    "semantically from the user's words (understand the meaning, not just exact "
+    "keywords). Hotels — cheapest/most affordable/'en ucuz'/'uygun fiyatlı'/'en "
+    "uygun'/'ekonomik'/'bütçe dostu'→price_asc; most expensive/'en pahalı'→"
+    "price_desc; best rated/'en iyi puanlı'/'en beğenilen'→rating_desc; most "
+    "luxurious/most stars/'lüks'/'5 yıldız'→stars_desc. Flights — cheapest/'en "
+    "ucuz'→price_asc; fastest/shortest/'en hızlı'/'en kısa'→duration_asc; direct/"
+    "fewest stops/'aktarmasız'/'direkt'→stops_asc; earliest/'en erken'→depart_asc; "
+    "latest/'en geç'→depart_desc. When the user states no preference, default to "
+    "price_asc. (19) Recommendation alignment: results come back already ordered by "
+    "the applied sort (echoed as `sortedBy`), so the FIRST option is the best match "
+    "for what the user asked. Recommend that first option by name. NEVER name an "
+    "option that is not in the returned results — the app renders the cards in this "
+    "exact order, so a name you invent or pull from memory will not be on screen."
 )
     
 
@@ -257,6 +270,100 @@ def _resolve_explicit_date_from_text(text: str, *, today: date | None = None) ->
 
 class AgentNotConfiguredError(Exception):
     """Raised when no OpenAI key is configured."""
+
+
+# ── Result ordering ──────────────────────────────────────────────────────────
+#
+# The providers (Google Flights / Hotels) return options in a relevance order,
+# not by price/quality. But the assistant's text reply names ONE best pick while
+# the UI only renders the first card(s) — so a named option that sat lower in the
+# list was invisible. We make ordering explicit and intent-driven: the model maps
+# the user's words ("cheapest", "en ucuz", "fastest", "luxury", "best rated") to
+# a `sort` key, the backend applies it deterministically, and the cards render in
+# that same order. Result: the option the model recommends is always the first
+# card, for EVERY phrasing the user can throw at it.
+
+
+def _num(value: Any) -> float | None:
+    # bool is an int subclass — exclude it so True/False never sort as 1/0.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _order_options(
+    options: list[dict[str, Any]],
+    value_fn: Any,
+    *,
+    reverse: bool = False,
+) -> list[dict[str, Any]]:
+    """Stable sort that always sinks options with a missing value to the end,
+    regardless of direction — so "cheapest/fastest first" never surfaces a
+    priceless/unknown row above real ones, and "most expensive" doesn't either.
+    """
+    present = [o for o in options if value_fn(o) is not None]
+    missing = [o for o in options if value_fn(o) is None]
+    present.sort(key=value_fn, reverse=reverse)
+    return present + missing
+
+
+def _hotel_total_price(o: dict[str, Any]) -> float | None:
+    total = _num(o.get("price"))
+    if total is not None:
+        return total
+    per_night = _num(o.get("perNight"))
+    if per_night is not None:
+        return per_night * (o.get("nights") or 1)
+    return None
+
+
+# Map a sort key → an ordering function. The key set is mirrored in each tool's
+# JSON schema enum, so the model can only ever pass a key we implement.
+_HOTEL_SORTS: dict[str, Any] = {
+    "price_asc": lambda o: _order_options(o, _hotel_total_price),
+    "price_desc": lambda o: _order_options(o, _hotel_total_price, reverse=True),
+    "rating_desc": lambda o: _order_options(
+        o, lambda x: _num(x.get("rating")), reverse=True
+    ),
+    "stars_desc": lambda o: _order_options(
+        o, lambda x: _num(x.get("stars")), reverse=True
+    ),
+}
+
+_FLIGHT_SORTS: dict[str, Any] = {
+    "price_asc": lambda o: _order_options(o, lambda x: _num(x.get("price"))),
+    "price_desc": lambda o: _order_options(
+        o, lambda x: _num(x.get("price")), reverse=True
+    ),
+    "duration_asc": lambda o: _order_options(
+        o, lambda x: _num(x.get("durationMinutes"))
+    ),
+    "stops_asc": lambda o: _order_options(o, lambda x: _num(x.get("stops"))),
+    "depart_asc": lambda o: _order_options(o, lambda x: x.get("departureTime") or None),
+    "depart_desc": lambda o: _order_options(
+        o, lambda x: x.get("departureTime") or None, reverse=True
+    ),
+}
+
+
+def _apply_sort(
+    options: list[dict[str, Any]],
+    sorts: dict[str, Any],
+    requested: Any,
+    *,
+    default: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """Order ``options`` by the requested sort key, falling back to ``default``.
+    Returns the ordered list and the sort key actually applied (echoed to the
+    model so its prose and the cards agree on what 'first' means)."""
+    key = (requested or "").strip() if isinstance(requested, str) else ""
+    fn = sorts.get(key)
+    if fn is None:
+        key = default
+        fn = sorts[default]
+    return fn(options), key
 
 
 # Human-readable labels for the enum-like preference fields.
@@ -511,6 +618,23 @@ _TOOLS = [
                     "outbound_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "return_date": {"type": "string", "description": "YYYY-MM-DD, optional for round trips"},
                     "adults": {"type": "integer", "minimum": 1, "default": 1},
+                    "sort": {
+                        "type": "string",
+                        "enum": [
+                            "price_asc",
+                            "price_desc",
+                            "duration_asc",
+                            "stops_asc",
+                            "depart_asc",
+                            "depart_desc",
+                        ],
+                        "description": (
+                            "Order results by the user's intent: price_asc=cheapest, "
+                            "price_desc=most expensive, duration_asc=fastest, "
+                            "stops_asc=fewest stops/direct, depart_asc=earliest "
+                            "departure, depart_desc=latest. Defaults to price_asc."
+                        ),
+                    },
                 },
                 "required": ["origin", "destination", "outbound_date"],
             },
@@ -558,6 +682,21 @@ _TOOLS = [
                     "check_in": {"type": "string", "description": "YYYY-MM-DD"},
                     "check_out": {"type": "string", "description": "YYYY-MM-DD"},
                     "adults": {"type": "integer", "minimum": 1, "default": 2},
+                    "sort": {
+                        "type": "string",
+                        "enum": [
+                            "price_asc",
+                            "price_desc",
+                            "rating_desc",
+                            "stars_desc",
+                        ],
+                        "description": (
+                            "Order results by the user's intent: price_asc=cheapest/"
+                            "most affordable, price_desc=most expensive, "
+                            "rating_desc=best guest rating, stars_desc=most stars/"
+                            "most luxurious. Defaults to price_asc."
+                        ),
+                    },
                 },
                 "required": ["location", "check_in", "check_out"],
             },
@@ -822,6 +961,11 @@ class AgentService:
             )
         except (FlightSearchError, KeyError) as exc:
             return {"error": f"search failed: {exc}"}
+        # Order by the user's intent (cheapest/fastest/fewest stops/earliest…) so
+        # the option the model recommends is the same one shown as the first card.
+        options, applied_sort = _apply_sort(
+            options, _FLIGHT_SORTS, args.get("sort"), default="price_asc"
+        )
         self.flight_options = options[:6]
         # Trim for the model (token budget): top 5 with the essentials.
         slim = [
@@ -843,6 +987,7 @@ class AgentService:
             "resolvedOrigin": origin,
             "resolvedDestination": destination,
             "resolvedOutboundDate": outbound_date,
+            "sortedBy": applied_sort,
         }
 
     async def _tool_get_budget(self) -> dict[str, Any]:
@@ -925,6 +1070,12 @@ class AgentService:
             )
         except (HotelSearchError, KeyError) as exc:
             return {"error": f"search failed: {exc}"}
+        # Order by the user's intent (cheapest/luxury/best-rated…). The cards the
+        # UI shows follow this same order, so the option the model names as the
+        # best match is always the first card.
+        options, applied_sort = _apply_sort(
+            options, _HOTEL_SORTS, args.get("sort"), default="price_asc"
+        )
         self.hotel_options = options[:6]
         slim = [
             {
@@ -938,7 +1089,7 @@ class AgentService:
             }
             for o in self.hotel_options[:5]
         ]
-        return {"options": slim, "count": len(slim)}
+        return {"options": slim, "count": len(slim), "sortedBy": applied_sort}
 
     async def _tool_book_hotel(self, args: dict) -> dict[str, Any]:
         try:
