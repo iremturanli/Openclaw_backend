@@ -43,7 +43,8 @@ services:
       STAYWALLET_DATABASE_URL: postgresql+asyncpg://staywallet:staywallet@db:5432/staywallet
       STAYWALLET_DATABASE_URL_SYNC: postgresql+psycopg2://staywallet:staywallet@db:5432/staywallet
     ports:
-      - "8000:8000"
+      # Host 8800 (8000 was taken on the server) → container's uvicorn :8000.
+      - "8800:8000"
     depends_on:
       db:
         condition: service_healthy
