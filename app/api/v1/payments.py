@@ -64,11 +64,18 @@ class CheckoutSessionResponse(BaseModel):
 
 
 class SessionStatusResponse(BaseModel):
+    # camelCase on the wire (the app reads `paymentStatus`); without the alias
+    # the JSON was snake_case, the client always read null → "unpaid", and the
+    # payment dialog span forever even after Stripe reported the charge paid.
+    model_config = ConfigDict(populate_by_name=True)
+
     status: str  # open | complete | expired
-    payment_status: str  # paid | unpaid | no_payment_required
+    payment_status: str = Field(
+        ..., alias="paymentStatus"
+    )  # paid | unpaid | no_payment_required
     # True only when a signature-verified webhook has confirmed this session
     # paid server-side — the authoritative signal fulfilment should trust.
-    webhook_verified: bool = False
+    webhook_verified: bool = Field(False, alias="webhookVerified")
 
 
 def get_stripe_service(
