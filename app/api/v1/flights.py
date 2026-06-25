@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.deps import get_current_user, get_flight_service
@@ -10,6 +12,34 @@ from app.models.travel_wallet import FlightSearchResponse
 from app.services.flight_service import FlightSearchError, FlightService
 
 router = APIRouter(prefix="/flights", tags=["flights"])
+
+
+def _coerce_outbound(value: str) -> str:
+    """Clamp a missing/malformed/past outbound date to today.
+
+    SerpApi rejects a past ``outbound_date`` outright, which the endpoint then
+    surfaced as a 502. Clamping keeps the search valid (and closest to intent)
+    instead of failing the request.
+    """
+    today = date.today()
+    try:
+        parsed = date.fromisoformat(value.strip())
+    except (ValueError, AttributeError):
+        return today.isoformat()
+    return (parsed if parsed >= today else today).isoformat()
+
+
+def _coerce_return(value: str | None, outbound_iso: str) -> str | None:
+    """Keep the return date only if it lands after the (coerced) outbound date;
+    otherwise push it a few days out so the round trip stays valid."""
+    if not value:
+        return None
+    outbound = date.fromisoformat(outbound_iso)
+    try:
+        parsed = date.fromisoformat(value.strip())
+    except (ValueError, AttributeError):
+        return (outbound + timedelta(days=3)).isoformat()
+    return (parsed if parsed > outbound else outbound + timedelta(days=3)).isoformat()
 
 
 @router.get(
@@ -27,6 +57,10 @@ async def search_flights(
     user: UserORM = Depends(get_current_user),
     service: FlightService = Depends(get_flight_service),
 ) -> FlightSearchResponse:
+    # Defend against stale/past dates (e.g. a default that aged past "today"):
+    # SerpApi errors on a past outbound_date and that became a 502.
+    outbound_date = _coerce_outbound(outbound_date)
+    return_date = _coerce_return(return_date, outbound_date)
     try:
         options = await service.search(
             origin=origin,
