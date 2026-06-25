@@ -50,12 +50,17 @@ async def issue_hotel_key(
             detail="Digital keys are issued for hotel bookings only.",
         )
 
-    external_ref = f"wallet:{purchase.id}"
-    existing = (
-        await session.execute(
-            select(StayORM).where(StayORM.external_ref == external_ref)
-        )
-    ).scalar_one_or_none()
+    stay_id = (purchase.details or {}).get("stayId")
+    existing = None
+    if isinstance(stay_id, str) and stay_id.strip():
+        existing = await session.get(StayORM, stay_id.strip())
+    if existing is None:
+        external_ref = f"wallet:{purchase.id}"
+        existing = (
+            await session.execute(
+                select(StayORM).where(StayORM.external_ref == external_ref)
+            )
+        ).scalar_one_or_none()
     if existing is not None:
         key_row = (
             await session.execute(
@@ -79,7 +84,7 @@ async def issue_hotel_key(
     digest = hashlib.sha256(purchase.id.encode()).digest()
     room_number = f"{4 + digest[0] % 4}{digest[1] % 30 + 1:02d}"
 
-    stay = StayORM(
+    stay = existing or StayORM(
         id=f"stay_{secrets.token_hex(8)}",
         property_name=purchase.title,
         room_number=room_number,
@@ -87,9 +92,10 @@ async def issue_hotel_key(
         check_out_date=check_out,
         address=purchase.subtitle or "Booked via StayWallet",
         source="manual",
-        external_ref=external_ref,
+        external_ref=f"wallet:{purchase.id}",
     )
-    session.add(stay)
+    if existing is None:
+        session.add(stay)
     check_in_row = CheckInORM(
         id=f"chk_{secrets.token_hex(8)}",
         stay_id=stay.id,

@@ -8,13 +8,13 @@ Reservations". Never real money.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.db.models.stay import StayORM
 from app.db.models.travel_wallet import PurchaseORM, WalletBudgetORM
 
 VALID_KINDS = {
@@ -103,6 +103,15 @@ class WalletService:
             raise InsufficientBudgetError(budget.balance_cents)
 
         now = datetime.now(timezone.utc)
+        normalized_details = dict(details or {})
+        if kind == "hotel":
+            stay = await self._ensure_hotel_stay(
+                purchase_title=title,
+                purchase_subtitle=subtitle,
+                purchase_details=normalized_details,
+                now=now,
+            )
+            normalized_details["stayId"] = stay.id
         budget.balance_cents -= amount_cents
         budget.updated_at = now
         purchase = PurchaseORM(
@@ -113,9 +122,46 @@ class WalletService:
             subtitle=subtitle,
             amount_cents=amount_cents,
             currency=currency or budget.currency,
-            details=details or {},
+            details=normalized_details,
             created_at=now,
         )
         self._session.add(purchase)
         await self._session.flush()
         return purchase, budget
+
+    async def _ensure_hotel_stay(
+        self,
+        *,
+        purchase_title: str,
+        purchase_subtitle: str,
+        purchase_details: dict[str, Any],
+        now: datetime,
+    ) -> StayORM:
+        raw_stay_id = purchase_details.get("stayId")
+        if isinstance(raw_stay_id, str) and raw_stay_id.strip():
+            existing = await self._session.get(StayORM, raw_stay_id.strip())
+            if existing is not None:
+                return existing
+
+        nights = 1
+        raw_nights = purchase_details.get("nights")
+        if isinstance(raw_nights, (int, float)) and raw_nights > 0:
+            nights = min(int(raw_nights), 30)
+
+        check_in = now.replace(minute=0, second=0, microsecond=0)
+        check_out = (check_in + timedelta(days=nights)).replace(hour=11)
+        stay_seed = uuid.uuid4().hex
+        room_number = f"{4 + int(stay_seed[0], 16) % 4}{int(stay_seed[1:3], 16) % 30 + 1:02d}"
+
+        stay = StayORM(
+            id=f"stay_{stay_seed[:16]}",
+            property_name=purchase_title,
+            room_number=room_number,
+            check_in_date=check_in,
+            check_out_date=check_out,
+            address=purchase_subtitle or "Booked via StayWallet",
+            source="manual",
+        )
+        self._session.add(stay)
+        await self._session.flush()
+        return stay
